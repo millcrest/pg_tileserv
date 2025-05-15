@@ -10,25 +10,29 @@
 ##      TARGETARCH - The architecture the resulting image is based on and the binary is compiled for
 ##      IMAGE_TAG - The tag to be applied to the container
 
+-include .env
 APPVERSION ?= latest
-GOVERSION ?= 1.21.6
+GOVERSION ?= 1.22.0
 PROGRAM ?= pg_tileserv
 CONFIG ?= config/$(PROGRAM).toml
-CONTAINER ?= harbor.internal.millcrest.dev/library/$(PROGRAM)
+CONTAINER ?= pramsey/$(PROGRAM)
 DATE ?= $(shell date +%Y%m%d)
 BASE_REGISTRY ?= registry.access.redhat.com
 BASE_IMAGE ?= ubi8-micro
-SYSTEMARCH = $(shell uname -i)
 
-# ifeq ($(SYSTEMARCH), x86_64)
-# TARGETARCH ?= amd64
-# PLATFORM=amd64
-# else
-# TARGETARCH ?= arm64
-# PLATFORM=arm64
-# endif
+ifeq ($(shell uname), Linux)
+SYSTEMARCH = $(shell uname -i)
+else
+SYSTEMARCH = $(shell uname -m)
+endif
+
+ifeq ($(SYSTEMARCH), x86_64)
 TARGETARCH ?= amd64
-PLATFORM ?= amd64
+PLATFORM=amd64
+else
+TARGETARCH ?= arm64
+PLATFORM=arm64
+endif
 
 IMAGE_TAG ?= $(APPVERSION)-$(TARGETARCH)
 DATE_TAG ?= $(DATE)-$(TARGETARCH)
