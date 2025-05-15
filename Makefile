@@ -10,15 +10,21 @@
 ##      TARGETARCH - The architecture the resulting image is based on and the binary is compiled for
 ##      IMAGE_TAG - The tag to be applied to the container
 
+-include .env
 APPVERSION ?= latest
-GOVERSION ?= 1.21.6
+GOVERSION ?= 1.22.0
 PROGRAM ?= pg_tileserv
 CONFIG ?= config/$(PROGRAM).toml
 CONTAINER ?= pramsey/$(PROGRAM)
 DATE ?= $(shell date +%Y%m%d)
 BASE_REGISTRY ?= registry.access.redhat.com
 BASE_IMAGE ?= ubi8-micro
+
+ifeq ($(shell uname), Linux)
 SYSTEMARCH = $(shell uname -i)
+else
+SYSTEMARCH = $(shell uname -m)
+endif
 
 ifeq ($(SYSTEMARCH), x86_64)
 TARGETARCH ?= amd64
@@ -83,6 +89,9 @@ build-common: Dockerfile
 		--label os.version="7.7" \
 		-t $(CONTAINER):$(IMAGE_TAG) -t $(CONTAINER):$(DATE_TAG) .
 	docker image prune --filter label=stage=tileservbuilder -f
+
+push-docker:
+	docker push ${CONTAINER}:${IMAGE_TAG}
 
 set-local:
 	$(eval BUILDTYPE = local)
