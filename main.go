@@ -454,19 +454,23 @@ func healthCheck(w http.ResponseWriter, r *http.Request) error {
 //	layer     – optional layer ID to restrict invalidation (e.g. "common.project_feature_tiles")
 //	$<param>  – optional $-prefixed identity params matching those used on tile requests
 //	            (e.g. "$project_uuid=my-unique-id"); requires layer to also be set
-//	bbox      – optional "xmin,ymin,xmax,ymax" in the CRS given by srid; when omitted
-//	            all tiles matching layer+identity are deleted regardless of location
-//	srid      – optional EPSG code for the bbox (default: server's default CRS)
-//	min_zoom  – optional, default 0    (only used with bbox)
-//	max_zoom  – optional, default DefaultMaxZoom  (only used with bbox)
+//	bbox      – optional, repeatable "xmin,ymin,xmax,ymax" in the CRS given by srid;
+//	            each bbox is invalidated independently; when omitted all tiles matching
+//	            layer+identity are deleted regardless of location
+//	srid      – optional EPSG code representing the projection of the bbox(es) (default: server's default CRS)
+//	min_zoom  – optional, default 0                (only used with bbox)
+//	max_zoom  – optional, default DefaultMaxZoom   (only used with bbox)
 //
 // Examples:
 //
 //	# Invalidate all tiles for one project (no bbox required)
 //	POST /cache/invalidate?layer=common.project_feature_tiles&$project_uuid=my-id
 //
-//	# Invalidate tiles for one project within a bbox
-//	POST /cache/invalidate?layer=common.project_feature_tiles&$project_uuid=my-id&bbox=300000,6800000,400000,6900000
+//	# Invalidate one bbox
+//	POST /cache/invalidate?layer=common.project_feature_tiles&$project_uuid=my-id&bbox=300000,6800000,400000,6900000&srid=28350
+//
+//	# Invalidate multiple bboxes in one request
+//	POST /cache/invalidate?layer=common.project_feature_tiles&$project_uuid=my-id&bbox=300000,6800000,400000,6900000&bbox=500000,6700000,600000,6800000&srid=28350
 func requestCacheInvalidate(w http.ResponseWriter, r *http.Request) error {
 	if globalCache == nil {
 		return tileAppError{
@@ -494,8 +498,10 @@ func requestCacheInvalidate(w http.ResponseWriter, r *http.Request) error {
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
+	bboxValues := q["bbox"] // all repeated bbox= values; nil/empty when not provided
+
 	// When no bbox is given, invalidate all tiles for the layer+identity.
-	if q.Get("bbox") == "" {
+	if len(bboxValues) == 0 {
 		deleted, err := globalCache.InvalidateLayer(ctx, layerID, identityParams)
 		if err != nil {
 			return tileAppError{HTTPCode: 500, SrcErr: err}
@@ -508,20 +514,7 @@ func requestCacheInvalidate(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	// bbox provided: parse and do a spatially-bounded invalidation.
-	parts := strings.Split(q.Get("bbox"), ",")
-	if len(parts) != 4 {
-		return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("bbox must be 4 comma-separated values: xmin,ymin,xmax,ymax")}
-	}
-	coords := make([]float64, 4)
-	for i, p := range parts {
-		v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
-		if err != nil {
-			return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("invalid bbox value %q: %w", p, err)}
-		}
-		coords[i] = v
-	}
-
+	// Parse shared zoom / srid params (apply to every bbox).
 	minZoom := 0
 	maxZoom := viper.GetInt("DefaultMaxZoom")
 	if z := q.Get("min_zoom"); z != "" {
@@ -551,15 +544,32 @@ func requestCacheInvalidate(w http.ResponseWriter, r *http.Request) error {
 		srid = v
 	}
 
-	deleted, err := globalCache.InvalidateBBox(ctx, coords[0], coords[1], coords[2], coords[3], minZoom, maxZoom, srid, layerID, identityParams)
-	if err != nil {
-		return tileAppError{HTTPCode: 400, SrcErr: err}
+	// Invalidate each bbox, accumulating the total deleted count.
+	var totalDeleted int64
+	for i, bboxStr := range bboxValues {
+		parts := strings.Split(bboxStr, ",")
+		if len(parts) != 4 {
+			return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("bbox[%d] must be 4 comma-separated values: xmin,ymin,xmax,ymax", i)}
+		}
+		coords := make([]float64, 4)
+		for j, p := range parts {
+			v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+			if err != nil {
+				return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("bbox[%d]: invalid value %q: %w", i, p, err)}
+			}
+			coords[j] = v
+		}
+		deleted, err := globalCache.InvalidateBBox(ctx, coords[0], coords[1], coords[2], coords[3], minZoom, maxZoom, srid, layerID, identityParams)
+		if err != nil {
+			return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("bbox[%d]: %w", i, err)}
+		}
+		totalDeleted += deleted
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"deleted": deleted,
-		"message": fmt.Sprintf("invalidated %d cached tile(s)", deleted),
+		"deleted": totalDeleted,
+		"message": fmt.Sprintf("invalidated %d cached tile(s)", totalDeleted),
 	})
 	return nil
 }
