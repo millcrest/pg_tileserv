@@ -193,6 +193,24 @@ func (c *TileCache) scanAndDelete(ctx context.Context, pattern string) (int64, e
 	return total, nil
 }
 
+// InvalidateLayer deletes all cached tiles for the given layer and optional
+// identity params, regardless of z/x/y. Use when you want to purge an entire
+// layer or a specific project identity without knowing the spatial extent.
+// If layerID is empty all tiles in the cache are deleted.
+func (c *TileCache) InvalidateLayer(ctx context.Context, layerID string, identityParams url.Values) (int64, error) {
+	layer := "*"
+	if layerID != "" {
+		layer = layerID
+	}
+	iHash := "*"
+	if len(identityParams) > 0 {
+		iHash = paramsHash(identityParams)
+	}
+	// Pattern matches all z/x/y/render combinations for the given layer+identity.
+	pattern := fmt.Sprintf("tile:%s:%s:*", layer, iHash)
+	return c.scanAndDelete(ctx, pattern)
+}
+
 // tileCacheKey builds a deterministic Redis key:
 //
 //	tile:{layerID}:{identityHash}:{z}:{x}:{y}:{renderHash}
