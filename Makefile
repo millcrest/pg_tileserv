@@ -12,7 +12,7 @@
 
 -include .env
 APPVERSION ?= latest
-GOVERSION ?= 1.22.0
+GOVERSION ?= 1.26.3
 PROGRAM ?= pg_tileserv
 CONFIG ?= config/$(PROGRAM).toml
 CONTAINER ?= pramsey/$(PROGRAM)

@@ -37,6 +37,15 @@
 # Zero means no cache control header will be set.
 # CacheTTL = 0
 
+# Redis server-side tile cache.
+# Set RedisAddr to enable caching. Tiles are stored per (layer, z, x, y, params).
+# Use POST /cache/invalidate?bbox=xmin,ymin,xmax,ymax to evict tiles by WGS84 extent.
+# RedisAddr = "localhost:6379"
+# RedisPassword = ""
+# RedisDB = 0
+# RedisTTL = 86400          # per-tile TTL in seconds (default 24 h)
+# CacheMaxInvalidateTiles = 500000  # safety cap on invalidation requests
+
 # Advertise URLs relative to this server name
 # default is to look this up from incoming request headers
 # UrlBase = "http://localhost/"

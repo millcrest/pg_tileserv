@@ -1,6 +1,6 @@
 # Lightweight Alpine-based pg_tileserv Docker Image
 # Author: Just van den Broecke
-FROM golang:1.21.3-alpine3.17
+FROM golang:1.26.3-alpine3.23
 
 # Build ARGS
 ARG VERSION="latest-alpine-3.17"
@@ -11,7 +11,7 @@ WORKDIR /app
 RUN go build -v -ldflags "-s -w -X main.programVersion=${VERSION}"
 
 # Multi-stage build: only copy build result and resources
-FROM alpine:3.17
+FROM alpine:3.23
 
 LABEL original_developer="Crunchy Data" \
     contributor="Just van den Broecke <justb4@gmail.com>" \
