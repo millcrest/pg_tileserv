@@ -454,7 +454,8 @@ func healthCheck(w http.ResponseWriter, r *http.Request) error {
 //	layer     – optional layer ID to restrict invalidation (e.g. "common.project_feature_tiles")
 //	$<param>  – optional $-prefixed identity params matching those used on tile requests
 //	            (e.g. "$project_uuid=my-unique-id"); requires layer to also be set
-//	bbox      – required, "xmin,ymin,xmax,ymax" in WGS84 degrees
+//	bbox      – required, "xmin,ymin,xmax,ymax" in the coordinate system specified by srid (or default CRS if srid is not provided)
+//   sird	     – optional, integer EPSG code of the coordinate system used for the bbox (e.g. 4326); defaults to server's default CRS
 //	min_zoom  – optional, default 0
 //	max_zoom  – optional, default DefaultMaxZoom
 //
@@ -526,16 +527,25 @@ func requestCacheInvalidate(w http.ResponseWriter, r *http.Request) error {
 		return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("min_zoom (%d) must be <= max_zoom (%d)", minZoom, maxZoom)}
 	}
 
+	srid := 0 // 0 = use the server's default coordinate system
+	if s := q.Get("srid"); s != "" {
+		v, err := strconv.Atoi(s)
+		if err != nil || v <= 0 {
+			return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("invalid srid: %s", s)}
+		}
+		srid = v
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
-	deleted, err := globalCache.InvalidateBBox(ctx, coords[0], coords[1], coords[2], coords[3], minZoom, maxZoom, layerID, identityParams)
+	deleted, err := globalCache.InvalidateBBox(ctx, coords[0], coords[1], coords[2], coords[3], minZoom, maxZoom, srid, layerID, identityParams)
 	if err != nil {
 		return tileAppError{HTTPCode: 400, SrcErr: err}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]any{
 		"deleted": deleted,
 		"message": fmt.Sprintf("invalidated %d cached tile(s)", deleted),
 	})
@@ -633,8 +643,8 @@ func applyCORS(origins []string, next http.Handler) http.Handler {
 			}
 		}
 		if r.Method == http.MethodOptions {
-			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS, POST, DELETE")
+			w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Origin, Authorization")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 			w.WriteHeader(http.StatusNoContent)
 			return

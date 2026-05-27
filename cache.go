@@ -76,19 +76,55 @@ func (c *TileCache) Set(ctx context.Context, key string, data []byte) {
 }
 
 // InvalidateBBox deletes all cached tiles whose (z,x,y) falls within the
-// WGS84 bounding box [xmin,ymin,xmax,ymax] for every zoom in [minZoom,maxZoom].
+// bounding box [xmin,ymin,xmax,ymax] (in the given srid) for every zoom in [minZoom,maxZoom].
+// When srid is 0 the server's default coordinate system is used.
 //
 // layerID filters to a specific layer (empty = all layers).
 // identityParams filters to a specific identity hash derived from $-prefixed
 // params such as $project_uuid (nil/empty = all identities).
 //
 // Returns the number of Redis keys deleted.
-func (c *TileCache) InvalidateBBox(ctx context.Context, xmin, ymin, xmax, ymax float64, minZoom, maxZoom int, layerID string, identityParams url.Values) (int64, error) {
-	// Clamp to valid WGS84 / Web Mercator extents.
-	xmin = math.Max(xmin, -180)
-	xmax = math.Min(xmax, 180)
-	ymin = math.Max(ymin, -85.051129)
-	ymax = math.Min(ymax, 85.051129)
+
+// tileXYInCRS converts a projected point (px, py) in the given CRS to tile
+// (x, y) indices at zoom. For SRID 4326 the Mercator slippy-map formula is
+// used; for all other SRIDs a linear subdivision of the CRS extent is used.
+func tileXYInCRS(zoom int, px, py float64, csXmin, csXmax, csYmin, csYmax float64) (x, y int) {
+	n := math.Pow(2, float64(zoom))
+	x = int(math.Floor((px - csXmin) / (csXmax - csXmin) * n))
+	y = int(math.Floor((csYmax - py) / (csYmax - csYmin) * n)) // y increases downward
+	maxIdx := int(n) - 1
+	if x < 0 {
+		x = 0
+	}
+	if x > maxIdx {
+		x = maxIdx
+	}
+	if y < 0 {
+		y = 0
+	}
+	if y > maxIdx {
+		y = maxIdx
+	}
+	return x, y
+}
+
+func (c *TileCache) InvalidateBBox(ctx context.Context, xmin, ymin, xmax, ymax float64, minZoom, maxZoom, srid int, layerID string, identityParams url.Values) (int64, error) {
+	// Resolve CRS bounds via getServerBounds: uses globalDefaultCoordinateSystem when
+	// srid is 0, reads from DB or config, and caches results in globalServerBounds.
+	var sridPtr *int
+	if srid != 0 {
+		sridPtr = &srid
+	}
+	bounds, err := getServerBounds(sridPtr)
+	if err != nil {
+		return 0, fmt.Errorf("SRID %d: %w", srid, err)
+	}
+
+	// Clamp bbox to the CRS extent.
+	xmin = math.Max(xmin, bounds.Xmin)
+	xmax = math.Min(xmax, bounds.Xmax)
+	ymin = math.Max(ymin, bounds.Ymin)
+	ymax = math.Min(ymax, bounds.Ymax)
 
 	if xmin >= xmax || ymin >= ymax {
 		return 0, fmt.Errorf("invalid bbox: xmin/ymin must be strictly less than xmax/ymax")
@@ -107,8 +143,8 @@ func (c *TileCache) InvalidateBBox(ctx context.Context, xmin, ymin, xmax, ymax f
 	}
 	var addrCount int64
 	for z := minZoom; z <= maxZoom; z++ {
-		x1, y1 := wgs84ToTileXY(z, xmin, ymax)
-		x2, y2 := wgs84ToTileXY(z, xmax, ymin)
+		x1, y1 := tileXYInCRS(z, xmin, ymax, bounds.Xmin, bounds.Xmax, bounds.Ymin, bounds.Ymax)
+		x2, y2 := tileXYInCRS(z, xmax, ymin, bounds.Xmin, bounds.Xmax, bounds.Ymin, bounds.Ymax)
 		addrCount += int64((x2 - x1 + 1) * (y2 - y1 + 1))
 	}
 	if addrCount > limit {
@@ -118,8 +154,8 @@ func (c *TileCache) InvalidateBBox(ctx context.Context, xmin, ymin, xmax, ymax f
 
 	var deleted int64
 	for z := minZoom; z <= maxZoom; z++ {
-		x1, y1 := wgs84ToTileXY(z, xmin, ymax) // y increases downward in tile coords
-		x2, y2 := wgs84ToTileXY(z, xmax, ymin)
+		x1, y1 := tileXYInCRS(z, xmin, ymax, bounds.Xmin, bounds.Xmax, bounds.Ymin, bounds.Ymax) // y increases downward in tile coords
+		x2, y2 := tileXYInCRS(z, xmax, ymin, bounds.Xmin, bounds.Xmax, bounds.Ymin, bounds.Ymax)
 		for x := x1; x <= x2; x++ {
 			for y := y1; y <= y2; y++ {
 				n, err := c.scanAndDelete(ctx, tileCachePattern(layerID, iHash, z, x, y))
@@ -215,27 +251,4 @@ func paramsHash(params url.Values) string {
 	}
 	h := sha256.Sum256([]byte(sb.String()))
 	return fmt.Sprintf("%x", h[:8])
-}
-
-// wgs84ToTileXY converts a WGS84 (lng, lat) point to XYZ tile coordinates at zoom
-// using the standard Web Mercator slippy-map formula.
-func wgs84ToTileXY(zoom int, lng, lat float64) (x, y int) {
-	n := math.Pow(2, float64(zoom))
-	x = int(math.Floor((lng + 180.0) / 360.0 * n))
-	latRad := lat * math.Pi / 180.0
-	y = int(math.Floor((1.0 - math.Log(math.Tan(latRad)+1.0/math.Cos(latRad))/math.Pi) / 2.0 * n))
-	maxIdx := int(n) - 1
-	if x < 0 {
-		x = 0
-	}
-	if x > maxIdx {
-		x = maxIdx
-	}
-	if y < 0 {
-		y = 0
-	}
-	if y > maxIdx {
-		y = maxIdx
-	}
-	return x, y
 }
