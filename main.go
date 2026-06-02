@@ -354,18 +354,19 @@ func requestDetailJSON(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// requestTile handles a tile request for a given layer
-func requestTile(r *http.Request, source string, srid *int) ([]byte, error) {
+// requestTile fetches a single tile, returning the MVT data and whether it was
+// served from the Redis cache (true = HIT, false = MISS or cache disabled).
+func requestTile(r *http.Request, source string, srid *int) ([]byte, bool, error) {
 	vars := mux.Vars(r)
 
 	lyr, err := getLayer(source)
 	if err != nil {
-		return nil, tileAppError{HTTPCode: 404, SrcErr: err}
+		return nil, false, tileAppError{HTTPCode: 404, SrcErr: err}
 	}
 
 	tile, errTile := makeTile(vars, srid)
 	if errTile != nil {
-		return nil, errTile
+		return nil, false, errTile
 	}
 
 	log.WithFields(log.Fields{
@@ -384,7 +385,7 @@ func requestTile(r *http.Request, source string, srid *int) ([]byte, error) {
 				"topic": "hit",
 				"key":   tile.String(),
 			}).Tracef("cache hit: %s", tile.String())
-			return data, nil
+			return data, true, nil
 		}
 	}
 
@@ -394,7 +395,7 @@ func requestTile(r *http.Request, source string, srid *int) ([]byte, error) {
 	tilerequest := lyr.GetTileRequest(tile, r)
 	mvt, errMvt := dBTileRequest(ctx, &tilerequest)
 	if errMvt != nil {
-		return nil, errMvt
+		return nil, false, errMvt
 	}
 
 	// Store in cache on successful DB fetch.
@@ -402,7 +403,7 @@ func requestTile(r *http.Request, source string, srid *int) ([]byte, error) {
 		globalCache.Set(r.Context(), cacheKey, mvt)
 	}
 
-	return mvt, nil
+	return mvt, false, nil
 }
 
 // requestTiles handles a tile request for a given layer, including multi layer tile requests
@@ -419,11 +420,15 @@ func requestTiles(w http.ResponseWriter, r *http.Request) error {
 
 	sources := strings.Split(vars["name"], ",")
 	var extant []string
+	allCacheHits := globalCache != nil // start optimistic; set false on any MISS
 	for _, source := range sources {
 		if !slices.Contains(extant, source) {
-			layer, err := requestTile(r, source, srid)
+			layer, cacheHit, err := requestTile(r, source, srid)
 			if err != nil {
 				return err
+			}
+			if !cacheHit {
+				allCacheHits = false
 			}
 			layers = append(layers, layer...)
 			extant = append(extant, source)
@@ -433,6 +438,13 @@ func requestTiles(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	w.Header().Add("Content-Type", "application/vnd.mapbox-vector-tile")
+	if globalCache != nil {
+		if allCacheHits {
+			w.Header().Set("X-Cache", "HIT")
+		} else {
+			w.Header().Set("X-Cache", "MISS")
+		}
+	}
 
 	if _, errWrite := w.Write(layers); errWrite != nil {
 		return errWrite
