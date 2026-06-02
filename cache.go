@@ -75,16 +75,6 @@ func (c *TileCache) Set(ctx context.Context, key string, data []byte) {
 	}
 }
 
-// InvalidateBBox deletes all cached tiles whose (z,x,y) falls within the
-// bounding box [xmin,ymin,xmax,ymax] (in the given srid) for every zoom in [minZoom,maxZoom].
-// When srid is 0 the server's default coordinate system is used.
-//
-// layerID filters to a specific layer (empty = all layers).
-// identityParams filters to a specific identity hash derived from $-prefixed
-// params such as $project_uuid (nil/empty = all identities).
-//
-// Returns the number of Redis keys deleted.
-
 // tileXYInCRS converts a projected point (px, py) in the given CRS to tile
 // (x, y) indices at zoom. For SRID 4326 the Mercator slippy-map formula is
 // used; for all other SRIDs a linear subdivision of the CRS extent is used.
@@ -108,6 +98,16 @@ func tileXYInCRS(zoom int, px, py float64, csXmin, csXmax, csYmin, csYmax float6
 	return x, y
 }
 
+// InvalidateBBox deletes all cached tiles whose (z,x,y) falls within the
+// bounding box [xmin,ymin,xmax,ymax] (in the given srid) for every zoom in [minZoom,maxZoom].
+//
+//
+// When srid is 0 the server's default coordinate system is used.
+// layerID filters to a specific layer (empty = all layers).
+// identityParams filters to a specific identity hash derived from $-prefixed
+// params such as $project_uuid (nil/empty = all identities).
+//
+// Returns the number of Redis keys deleted.
 func (c *TileCache) InvalidateBBox(ctx context.Context, xmin, ymin, xmax, ymax float64, minZoom, maxZoom, srid int, layerID string, identityParams url.Values) (int64, error) {
 	// Resolve CRS bounds via getServerBounds: uses globalDefaultCoordinateSystem when
 	// srid is 0, reads from DB or config, and caches results in globalServerBounds.

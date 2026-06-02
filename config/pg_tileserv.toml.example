@@ -39,7 +39,6 @@
 
 # Redis server-side tile cache.
 # Set RedisAddr to enable caching. Tiles are stored per (layer, z, x, y, params).
-# Use POST /cache/invalidate?bbox=xmin,ymin,xmax,ymax to evict tiles by WGS84 extent.
 # RedisAddr = "localhost:6379"
 # RedisPassword = ""
 # RedisDB = 0
