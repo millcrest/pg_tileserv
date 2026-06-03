@@ -123,14 +123,14 @@ func getSQLTemplate(name string, tmpl string) *template.Template {
 	return tp
 }
 
-func renderSQLTemplate(name string, tmpl string, data interface{}) (string, error) {
+func renderSQLTemplate(name string, tmpl string, data any) (string, error) {
 	var buf bytes.Buffer
 	t := getSQLTemplate(name, tmpl)
 	err := t.Execute(&buf, data)
 	if err != nil {
-		return string(buf.Bytes()), err
+		return buf.String(), err
 	}
-	sql := string(buf.Bytes())
+	sql := buf.String()
 	log.Debug(sql)
 	return sql, nil
 }

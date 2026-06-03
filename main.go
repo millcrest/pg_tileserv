@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"io/ioutil"
+
 	"net/http"
 	"os"
 	"os/signal"
@@ -96,6 +96,13 @@ func init() {
 	viper.SetDefault("BasePath", "/")
 	viper.SetDefault("CacheTTL", 0)          // cache timeout in seconds
 	viper.SetDefault("EnableMetrics", false) // Prometheus metrics
+
+	// Redis tile cache
+	viper.SetDefault("RedisAddr", "")           // e.g. "localhost:6379"
+	viper.SetDefault("RedisPassword", "")
+	viper.SetDefault("RedisDB", 0)
+	viper.SetDefault("RedisTTL", 86400)         // per-tile TTL in seconds (default 24 h)
+	viper.SetDefault("CacheMaxInvalidateTiles", 500_000)
 
 	viper.SetDefault("DefaultCoordinateSystem", 3857)
 	// XMin, YMin, XMax, YMax, must be square
@@ -186,7 +193,7 @@ func main() {
 	}
 
 	// enable debug mode if specified in config file, even if not specified by commandline argument
-	if viper.GetBool("Debug") == true {
+	if viper.GetBool("Debug") {
 		log.SetLevel(log.TraceLevel)
 	}
 
@@ -221,6 +228,9 @@ func main() {
 		"libprotobuf": globalVersions["LIBPROTOBUF"],
 	}).Debugf("Connected to PostGIS version %s\n", globalVersions["POSTGIS"])
 
+	// Initialise the Redis tile cache (no-op when RedisAddr is not configured)
+	initCache()
+
 	// Get to work
 	handleRequests()
 }
@@ -254,20 +264,18 @@ func requestPreview(w http.ResponseWriter, r *http.Request) error {
 		return errLyr
 	}
 
-	switch lyr.(type) {
+	switch l := lyr.(type) {
 	case LayerTable:
 		tmpl, err := template.ParseFiles(fmt.Sprintf("%s/preview-table.html", viper.GetString("AssetsPath")))
 		if err != nil {
 			return err
 		}
-		l, _ := lyr.(LayerTable)
 		tmpl.Execute(w, l)
 	case LayerFunction:
 		tmpl, err := template.ParseFiles(fmt.Sprintf("%s/preview-function.html", viper.GetString("AssetsPath")))
 		if err != nil {
 			return err
 		}
-		l, _ := lyr.(LayerFunction)
 		tmpl.Execute(w, l)
 	default:
 		return errors.New("unknown layer type") // never get here
@@ -287,7 +295,7 @@ func requestListHTML(w http.ResponseWriter, r *http.Request) error {
 	}
 	jsonLayers := getJSONLayers(r)
 
-	content, err := ioutil.ReadFile(fmt.Sprintf("%s/index.html", viper.GetString("AssetsPath")))
+	content, err := os.ReadFile(fmt.Sprintf("%s/index.html", viper.GetString("AssetsPath")))
 
 	if err != nil {
 		return err
@@ -346,22 +354,19 @@ func requestDetailJSON(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// requestTile handles a tile request for a given layer
-func requestTile(r *http.Request, source string, srid *int) ([]byte, error) {
+// requestTile fetches a single tile, returning the MVT data and whether it was
+// served from the Redis cache (true = HIT, false = MISS or cache disabled).
+func requestTile(r *http.Request, source string, srid *int) ([]byte, bool, error) {
 	vars := mux.Vars(r)
 
 	lyr, err := getLayer(source)
 	if err != nil {
-		errLyr := tileAppError{
-			HTTPCode: 404,
-			SrcErr:   err,
-		}
-		return nil, errLyr
+		return nil, false, tileAppError{HTTPCode: 404, SrcErr: err}
 	}
 
 	tile, errTile := makeTile(vars, srid)
 	if errTile != nil {
-		return nil, errTile
+		return nil, false, errTile
 	}
 
 	log.WithFields(log.Fields{
@@ -370,16 +375,35 @@ func requestTile(r *http.Request, source string, srid *int) ([]byte, error) {
 		"key":   tile.String(),
 	}).Tracef("requestTile: %s", tile.String())
 
+	// Check the Redis tile cache before hitting the database.
+	var cacheKey string
+	if globalCache != nil {
+		cacheKey = tileCacheKey(lyr.GetID(), tile.Zoom, tile.X, tile.Y, r.URL.Query())
+		if data, ok := globalCache.Get(r.Context(), cacheKey); ok {
+			log.WithFields(log.Fields{
+				"event": "cache",
+				"topic": "hit",
+				"key":   tile.String(),
+			}).Tracef("cache hit: %s", tile.String())
+			return data, true, nil
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), viper.GetDuration("DbTimeout")*time.Second)
 	defer cancel()
 
 	tilerequest := lyr.GetTileRequest(tile, r)
 	mvt, errMvt := dBTileRequest(ctx, &tilerequest)
 	if errMvt != nil {
-		return nil, errMvt
+		return nil, false, errMvt
 	}
 
-	return mvt, nil
+	// Store in cache on successful DB fetch.
+	if globalCache != nil {
+		globalCache.Set(r.Context(), cacheKey, mvt)
+	}
+
+	return mvt, false, nil
 }
 
 // requestTiles handles a tile request for a given layer, including multi layer tile requests
@@ -396,11 +420,15 @@ func requestTiles(w http.ResponseWriter, r *http.Request) error {
 
 	sources := strings.Split(vars["name"], ",")
 	var extant []string
+	allCacheHits := globalCache != nil // start optimistic; set false on any MISS
 	for _, source := range sources {
 		if !slices.Contains(extant, source) {
-			layer, err := requestTile(r, source, srid)
+			layer, cacheHit, err := requestTile(r, source, srid)
 			if err != nil {
 				return err
+			}
+			if !cacheHit {
+				allCacheHits = false
 			}
 			layers = append(layers, layer...)
 			extant = append(extant, source)
@@ -410,6 +438,13 @@ func requestTiles(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	w.Header().Add("Content-Type", "application/vnd.mapbox-vector-tile")
+	if globalCache != nil {
+		if allCacheHits {
+			w.Header().Set("X-Cache", "HIT")
+		} else {
+			w.Header().Set("X-Cache", "MISS")
+		}
+	}
 
 	if _, errWrite := w.Write(layers); errWrite != nil {
 		return errWrite
@@ -422,6 +457,132 @@ func requestTiles(w http.ResponseWriter, r *http.Request) error {
 func healthCheck(w http.ResponseWriter, r *http.Request) error {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("200 OK"))
+	return nil
+}
+
+// requestCacheInvalidate evicts Redis-cached tiles matching the given filters.
+// Query parameters:
+//
+//	layer     – optional layer ID to restrict invalidation (e.g. "common.project_feature_tiles")
+//	$<param>  – optional $-prefixed identity params matching those used on tile requests
+//	            (e.g. "$project_uuid=my-unique-id"); requires layer to also be set
+//	bbox      – optional, repeatable "xmin,ymin,xmax,ymax" in the CRS given by srid;
+//	            each bbox is invalidated independently; when omitted all tiles matching
+//	            layer+identity are deleted regardless of location
+//	srid      – optional EPSG code representing the projection of the bbox(es) (default: server's default CRS)
+//	min_zoom  – optional, default 0                (only used with bbox)
+//	max_zoom  – optional, default DefaultMaxZoom   (only used with bbox)
+//
+// Examples:
+//
+//	# Invalidate all tiles for one project (no bbox required)
+//	POST /cache/invalidate?layer=common.project_feature_tiles&$project_uuid=my-id
+//
+//	# Invalidate one bbox
+//	POST /cache/invalidate?layer=common.project_feature_tiles&$project_uuid=my-id&bbox=300000,6800000,400000,6900000&srid=28350
+//
+//	# Invalidate multiple bboxes in one request
+//	POST /cache/invalidate?layer=common.project_feature_tiles&$project_uuid=my-id&bbox=300000,6800000,400000,6900000&bbox=500000,6700000,600000,6800000&srid=28350
+func requestCacheInvalidate(w http.ResponseWriter, r *http.Request) error {
+	if globalCache == nil {
+		return tileAppError{
+			HTTPCode: http.StatusServiceUnavailable,
+			SrcErr:   fmt.Errorf("tile caching is not enabled"),
+		}
+	}
+
+	q := r.URL.Query()
+
+	// Optional layer filter.
+	layerID := q.Get("layer")
+
+	// Collect $-prefixed identity params (PostgreSQL function arguments).
+	identityParams := make(map[string][]string)
+	for k, v := range q {
+		if strings.HasPrefix(k, "$") {
+			identityParams[k] = v
+		}
+	}
+	if len(identityParams) > 0 && layerID == "" {
+		return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("'layer' is required when identity params ($...) are specified")}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	bboxValues := q["bbox"] // all repeated bbox= values; nil/empty when not provided
+
+	// When no bbox is given, invalidate all tiles for the layer+identity.
+	if len(bboxValues) == 0 {
+		deleted, err := globalCache.InvalidateLayer(ctx, layerID, identityParams)
+		if err != nil {
+			return tileAppError{HTTPCode: 500, SrcErr: err}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"deleted": deleted,
+			"message": fmt.Sprintf("invalidated %d cached tile(s)", deleted),
+		})
+		return nil
+	}
+
+	// Parse shared zoom / srid params (apply to every bbox).
+	minZoom := 0
+	maxZoom := viper.GetInt("DefaultMaxZoom")
+	if z := q.Get("min_zoom"); z != "" {
+		v, err := strconv.Atoi(z)
+		if err != nil || v < 0 {
+			return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("invalid min_zoom: %s", z)}
+		}
+		minZoom = v
+	}
+	if z := q.Get("max_zoom"); z != "" {
+		v, err := strconv.Atoi(z)
+		if err != nil || v < 0 {
+			return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("invalid max_zoom: %s", z)}
+		}
+		maxZoom = v
+	}
+	if minZoom > maxZoom {
+		return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("min_zoom (%d) must be <= max_zoom (%d)", minZoom, maxZoom)}
+	}
+
+	srid := 0 // 0 = use the server's default coordinate system
+	if s := q.Get("srid"); s != "" {
+		v, err := strconv.Atoi(s)
+		if err != nil || v <= 0 {
+			return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("invalid srid: %s", s)}
+		}
+		srid = v
+	}
+
+	// Invalidate each bbox, accumulating the total deleted count.
+	var totalDeleted int64
+	for i, bboxStr := range bboxValues {
+		parts := strings.Split(bboxStr, ",")
+		if len(parts) != 4 {
+			return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("bbox[%d] must be 4 comma-separated values: xmin,ymin,xmax,ymax", i)}
+		}
+		coords := make([]float64, 4)
+		for j, p := range parts {
+			v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+			if err != nil {
+				return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("bbox[%d]: invalid value %q: %w", i, p, err)}
+			}
+			coords[j] = v
+		}
+		deleted, err := globalCache.InvalidateBBox(ctx, coords[0], coords[1], coords[2], coords[3], minZoom, maxZoom, srid, layerID, identityParams)
+		if err != nil {
+			return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("bbox[%d]: %w", i, err)}
+		}
+		totalDeleted += deleted
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"deleted": totalDeleted,
+		"message": fmt.Sprintf("invalidated %d cached tile(s)", totalDeleted),
+	})
 	return nil
 }
 
@@ -442,7 +603,7 @@ func (tae tileAppError) Error() string {
 	if tae.Message != "" {
 		return fmt.Sprintf("%s\n%s", tae.Message, tae.SrcErr.Error())
 	}
-	return fmt.Sprintf("%s", tae.SrcErr.Error())
+	return tae.SrcErr.Error()
 }
 
 // tileAppHandler is a function handler that can replace the
@@ -461,7 +622,7 @@ func (fn tileAppHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"url":    r.URL,
 	}).Infof("%s %s", r.Method, r.URL)
 	if err := fn(w, r); err != nil {
-		if hdr, ok := r.Header["x-correlation-id"]; ok {
+		if hdr, ok := r.Header["X-Correlation-Id"]; ok {
 			log.WithField("correlation-id", hdr[0])
 		}
 		if e, ok := err.(tileAppError); ok {
@@ -495,6 +656,37 @@ func setCacheControl(next http.Handler) http.Handler {
 	})
 }
 
+// applyCORS sets CORS response headers. When origins contains "*" the header
+// Access-Control-Allow-Origin: * is written unconditionally, which keeps
+// things working even when a reverse proxy has already stripped the Origin
+// request header before forwarding to this server.
+func applyCORS(origins []string, next http.Handler) http.Handler {
+	allowAll := slices.Contains(origins, "*")
+	allowed := make(map[string]bool, len(origins))
+	for _, o := range origins {
+		allowed[o] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowAll {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		} else {
+			origin := r.Header.Get("Origin")
+			if origin != "" && allowed[origin] {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Add("Vary", "Origin")
+			}
+		}
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS, POST, DELETE")
+			w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Origin, Authorization")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 /******************************************************************************/
 
 func tileRouter() *mux.Router {
@@ -523,6 +715,9 @@ func tileRouter() *mux.Router {
 		r.Handle("/metrics", promhttp.Handler())
 	}
 
+	// Cache invalidation endpoint
+	r.Handle("/cache/invalidate", tileAppHandler(requestCacheInvalidate)).Methods(http.MethodPost, http.MethodDelete)
+
 	r.Handle(viper.GetString("HealthEndpoint"), tileAppHandler(healthCheck)).Methods(http.MethodGet)
 	return r
 }
@@ -534,7 +729,6 @@ func handleRequests() {
 
 	// Allow CORS from anywhere
 	corsOrigins := viper.GetStringSlice("CORSOrigins")
-	corsOpt := handlers.AllowedOrigins(corsOrigins)
 
 	// Set a writeTimeout for the http server.
 	// This value is the application's DbTimeout config setting plus a
@@ -550,7 +744,7 @@ func handleRequests() {
 		ReadTimeout:  1 * time.Second,
 		WriteTimeout: writeTimeout,
 		Addr:         fmt.Sprintf("%s:%d", viper.GetString("HttpHost"), viper.GetInt("HttpPort")),
-		Handler:      setCacheControl(handlers.CompressHandler(handlers.CORS(corsOpt)(r))),
+		Handler:      setCacheControl(handlers.CompressHandler(applyCORS(corsOrigins, r))),
 	}
 
 	// start http service
@@ -579,7 +773,7 @@ func handleRequests() {
 			ReadTimeout:  1 * time.Second,
 			WriteTimeout: writeTimeout,
 			Addr:         fmt.Sprintf("%s:%d", viper.GetString("HttpHost"), viper.GetInt("HttpsPort")),
-			Handler:      setCacheControl(handlers.CompressHandler(handlers.CORS(corsOpt)(r))),
+			Handler:      setCacheControl(handlers.CompressHandler(applyCORS(corsOrigins, r))),
 			TLSConfig: &tls.Config{
 				MinVersion: tls.VersionTLS12, // Secure TLS versions only
 			},
