@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,11 +102,10 @@ func tileXYInCRS(zoom int, px, py float64, csXmin, csXmax, csYmin, csYmax float6
 // InvalidateBBox deletes all cached tiles whose (z,x,y) falls within the
 // bounding box [xmin,ymin,xmax,ymax] (in the given srid) for every zoom in [minZoom,maxZoom].
 //
-//
 // When srid is 0 the server's default coordinate system is used.
 // layerID filters to a specific layer (empty = all layers).
-// identityParams filters to a specific identity hash derived from $-prefixed
-// params such as $project_uuid (nil/empty = all identities).
+// identityParams filters to a specific identity hash derived from the configured
+// identity params (e.g. project_uuid); nil/empty = all identities.
 //
 // Returns the number of Redis keys deleted.
 func (c *TileCache) InvalidateBBox(ctx context.Context, xmin, ymin, xmax, ymax float64, minZoom, maxZoom, srid int, layerID string, identityParams url.Values) (int64, error) {
@@ -136,7 +136,8 @@ func (c *TileCache) InvalidateBBox(ctx context.Context, xmin, ymin, xmax, ymax f
 		iHash = paramsHash(identityParams)
 	}
 
-	// Guard against runaway invalidation (e.g. full-world at zoom 20).
+	// Guard against runaway invalidation (e.g. full-world at zoom 20). Count
+	// addresses cheaply first so we never allocate an oversized target set.
 	limit := int64(viper.GetInt("CacheMaxInvalidateTiles"))
 	if limit <= 0 {
 		limit = 500_000
@@ -152,36 +153,55 @@ func (c *TileCache) InvalidateBBox(ctx context.Context, xmin, ymin, xmax, ymax f
 			addrCount, limit)
 	}
 
-	var deleted int64
+	// Build the set of target (z,x,y) addresses once, then perform a SINGLE
+	// SCAN over the layer+identity prefix and delete only keys whose address
+	// is in the set. This is O(keyspace) instead of O(addresses * keyspace).
+	targets := make(map[[3]int]struct{}, addrCount)
 	for z := minZoom; z <= maxZoom; z++ {
 		x1, y1 := tileXYInCRS(z, xmin, ymax, bounds.Xmin, bounds.Xmax, bounds.Ymin, bounds.Ymax) // y increases downward in tile coords
 		x2, y2 := tileXYInCRS(z, xmax, ymin, bounds.Xmin, bounds.Xmax, bounds.Ymin, bounds.Ymax)
 		for x := x1; x <= x2; x++ {
 			for y := y1; y <= y2; y++ {
-				n, err := c.scanAndDelete(ctx, tileCachePattern(layerID, iHash, z, x, y))
-				if err != nil {
-					return deleted, err
-				}
-				deleted += n
+				targets[[3]int{z, x, y}] = struct{}{}
 			}
 		}
 	}
-	return deleted, nil
+
+	return c.scanAndUnlink(ctx, tilePrefixPattern(layerID, iHash), func(key string) bool {
+		z, x, y, ok := tileAddrFromKey(key)
+		if !ok {
+			return false
+		}
+		_, hit := targets[[3]int{z, x, y}]
+		return hit
+	})
 }
 
-// scanAndDelete finds all Redis keys matching pattern via SCAN and deletes them.
-func (c *TileCache) scanAndDelete(ctx context.Context, pattern string) (int64, error) {
+// scanAndUnlink iterates Redis keys matching pattern via SCAN and removes those
+// for which keep returns true (a nil keep removes every match). It uses UNLINK
+// (asynchronous, non-blocking memory reclaim) rather than DEL so bulk
+// invalidation does not stall the Redis main thread.
+func (c *TileCache) scanAndUnlink(ctx context.Context, pattern string, keep func(string) bool) (int64, error) {
 	var cursor uint64
 	var total int64
 	for {
-		keys, next, err := c.client.Scan(ctx, cursor, pattern, 100).Result()
+		keys, next, err := c.client.Scan(ctx, cursor, pattern, 1000).Result()
 		if err != nil {
 			return total, fmt.Errorf("redis SCAN(%q): %w", pattern, err)
 		}
-		if len(keys) > 0 {
-			n, err := c.client.Del(ctx, keys...).Result()
+		batch := keys
+		if keep != nil {
+			batch = batch[:0]
+			for _, k := range keys {
+				if keep(k) {
+					batch = append(batch, k)
+				}
+			}
+		}
+		if len(batch) > 0 {
+			n, err := c.client.Unlink(ctx, batch...).Result()
 			if err != nil {
-				return total, fmt.Errorf("redis DEL: %w", err)
+				return total, fmt.Errorf("redis UNLINK: %w", err)
 			}
 			total += n
 		}
@@ -193,38 +213,55 @@ func (c *TileCache) scanAndDelete(ctx context.Context, pattern string) (int64, e
 	return total, nil
 }
 
+// tileAddrFromKey extracts the (z,x,y) tile address from a cache key of the form
+// tile:{layerID}:{identityHash}:{z}:{x}:{y}:{renderHash}. ok is false when the
+// key does not have the expected shape (layerID never contains a colon).
+func tileAddrFromKey(key string) (z, x, y int, ok bool) {
+	parts := strings.Split(key, ":")
+	if len(parts) != 7 {
+		return 0, 0, 0, false
+	}
+	var err error
+	if z, err = strconv.Atoi(parts[3]); err != nil {
+		return 0, 0, 0, false
+	}
+	if x, err = strconv.Atoi(parts[4]); err != nil {
+		return 0, 0, 0, false
+	}
+	if y, err = strconv.Atoi(parts[5]); err != nil {
+		return 0, 0, 0, false
+	}
+	return z, x, y, true
+}
+
 // InvalidateLayer deletes all cached tiles for the given layer and optional
 // identity params, regardless of z/x/y. Use when you want to purge an entire
 // layer or a specific project identity without knowing the spatial extent.
 // If layerID is empty all tiles in the cache are deleted.
 func (c *TileCache) InvalidateLayer(ctx context.Context, layerID string, identityParams url.Values) (int64, error) {
-	layer := "*"
-	if layerID != "" {
-		layer = layerID
-	}
-	iHash := "*"
+	iHash := ""
 	if len(identityParams) > 0 {
 		iHash = paramsHash(identityParams)
 	}
 	// Pattern matches all z/x/y/render combinations for the given layer+identity.
-	pattern := fmt.Sprintf("tile:%s:%s:*", layer, iHash)
-	return c.scanAndDelete(ctx, pattern)
+	return c.scanAndUnlink(ctx, tilePrefixPattern(layerID, iHash), nil)
 }
 
 // tileCacheKey builds a deterministic Redis key:
 //
 //	tile:{layerID}:{identityHash}:{z}:{x}:{y}:{renderHash}
 //
-// Identity params are $-prefixed PostgreSQL function arguments (e.g. $project_uuid).
-// Render params are everything else (srid, tolerance, properties, …).
+// Identity params are those configured via CacheIdentityParams (e.g. project_uuid);
+// render params are everything else (srid, tolerance, properties, …).
 func tileCacheKey(layerID string, z, x, y int, params url.Values) string {
 	identity, render := splitParams(params)
 	return fmt.Sprintf("tile:%s:%s:%d:%d:%d:%s", layerID, paramsHash(identity), z, x, y, paramsHash(render))
 }
 
-// tileCachePattern returns a Redis SCAN glob for a tile address (z,x,y).
-// Pass an empty layerID or identityHash to match any value in that position.
-func tileCachePattern(layerID, identityHash string, z, x, y int) string {
+// tilePrefixPattern returns a Redis SCAN glob matching every tile for a
+// layer+identity, across all z/x/y/render values. Pass an empty layerID or
+// identityHash to match any value in that position.
+func tilePrefixPattern(layerID, identityHash string) string {
 	layer := "*"
 	if layerID != "" {
 		layer = layerID
@@ -233,16 +270,36 @@ func tileCachePattern(layerID, identityHash string, z, x, y int) string {
 	if identityHash != "" {
 		iHash = identityHash
 	}
-	return fmt.Sprintf("tile:%s:%s:%d:%d:%d:*", layer, iHash, z, x, y)
+	return fmt.Sprintf("tile:%s:%s:*", layer, iHash)
 }
 
-// splitParams separates query params into identity ($-prefixed) and render (rest).
+// identityParamNames returns the set of query-param names (from the
+// CacheIdentityParams config) that identify a logical tile set rather than a
+// render variant. A leading '$' is stripped so "project_uuid" and
+// "$project_uuid" are treated identically.
+func identityParamNames() map[string]struct{} {
+	set := make(map[string]struct{})
+	for n := range strings.SplitSeq(viper.GetString("CacheIdentityParams"), ",") {
+		n = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(n), "$"))
+		if n != "" {
+			set[n] = struct{}{}
+		}
+	}
+	return set
+}
+
+// splitParams separates query params into identity and render buckets using the
+// configured identity-param names. Identity keys are normalized (any leading '$'
+// removed) so the serve path (which sees e.g. "project_uuid") and the
+// invalidation path (which may send "$project_uuid") hash to the same identity.
 func splitParams(params url.Values) (identity url.Values, render url.Values) {
 	identity = make(url.Values)
 	render = make(url.Values)
+	idNames := identityParamNames()
 	for k, v := range params {
-		if strings.HasPrefix(k, "$") {
-			identity[k] = v
+		name := strings.TrimPrefix(k, "$")
+		if _, ok := idNames[name]; ok {
+			identity[name] = v
 		} else {
 			render[k] = v
 		}
