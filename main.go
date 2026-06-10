@@ -98,11 +98,12 @@ func init() {
 	viper.SetDefault("EnableMetrics", false) // Prometheus metrics
 
 	// Redis tile cache
-	viper.SetDefault("RedisAddr", "")           // e.g. "localhost:6379"
+	viper.SetDefault("RedisAddr", "") // e.g. "localhost:6379"
 	viper.SetDefault("RedisPassword", "")
 	viper.SetDefault("RedisDB", 0)
-	viper.SetDefault("RedisTTL", 86400)         // per-tile TTL in seconds (default 24 h)
+	viper.SetDefault("RedisTTL", 86400) // per-tile TTL in seconds (default 24 h)
 	viper.SetDefault("CacheMaxInvalidateTiles", 500_000)
+	viper.SetDefault("CacheIdentityParams", "project_uuid")
 
 	viper.SetDefault("DefaultCoordinateSystem", 3857)
 	// XMin, YMin, XMax, YMax, must be square
@@ -496,15 +497,12 @@ func requestCacheInvalidate(w http.ResponseWriter, r *http.Request) error {
 	// Optional layer filter.
 	layerID := q.Get("layer")
 
-	// Collect $-prefixed identity params (PostgreSQL function arguments).
-	identityParams := make(map[string][]string)
-	for k, v := range q {
-		if strings.HasPrefix(k, "$") {
-			identityParams[k] = v
-		}
-	}
+	// Classify identity params (e.g. project_uuid) exactly as the serve path does
+	// via splitParams, so the identity hash matches what tiles were stored under.
+	// Control/render params (bbox, srid, zoom, …) fall into the discarded bucket.
+	identityParams, _ := splitParams(q)
 	if len(identityParams) > 0 && layerID == "" {
-		return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("'layer' is required when identity params ($...) are specified")}
+		return tileAppError{HTTPCode: 400, SrcErr: fmt.Errorf("'layer' is required when identity params are specified")}
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
