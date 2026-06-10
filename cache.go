@@ -142,27 +142,27 @@ func (c *TileCache) InvalidateBBox(ctx context.Context, xmin, ymin, xmax, ymax f
 	if limit <= 0 {
 		limit = 500_000
 	}
+
+	type zRange struct{ z, x1, y1, x2, y2 int }
+	ranges := make([]zRange, 0, maxZoom-minZoom+1)
 	var addrCount int64
 	for z := minZoom; z <= maxZoom; z++ {
 		x1, y1 := tileXYInCRS(z, xmin, ymax, bounds.Xmin, bounds.Xmax, bounds.Ymin, bounds.Ymax)
 		x2, y2 := tileXYInCRS(z, xmax, ymin, bounds.Xmin, bounds.Xmax, bounds.Ymin, bounds.Ymax)
+		ranges = append(ranges, zRange{z, x1, y1, x2, y2})
 		addrCount += int64((x2 - x1 + 1) * (y2 - y1 + 1))
 	}
+
 	if addrCount > limit {
 		return 0, fmt.Errorf("bbox spans %d tile addresses (limit %d); reduce zoom range or bbox area",
 			addrCount, limit)
 	}
 
-	// Build the set of target (z,x,y) addresses once, then perform a SINGLE
-	// SCAN over the layer+identity prefix and delete only keys whose address
-	// is in the set. This is O(keyspace) instead of O(addresses * keyspace).
 	targets := make(map[[3]int]struct{}, addrCount)
-	for z := minZoom; z <= maxZoom; z++ {
-		x1, y1 := tileXYInCRS(z, xmin, ymax, bounds.Xmin, bounds.Xmax, bounds.Ymin, bounds.Ymax) // y increases downward in tile coords
-		x2, y2 := tileXYInCRS(z, xmax, ymin, bounds.Xmin, bounds.Xmax, bounds.Ymin, bounds.Ymax)
-		for x := x1; x <= x2; x++ {
-			for y := y1; y <= y2; y++ {
-				targets[[3]int{z, x, y}] = struct{}{}
+	for _, r := range ranges {
+		for x := r.x1; x <= r.x2; x++ {
+			for y := r.y1; y <= r.y2; y++ {
+				targets[[3]int{r.z, x, y}] = struct{}{}
 			}
 		}
 	}
