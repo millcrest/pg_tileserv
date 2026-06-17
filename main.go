@@ -163,6 +163,9 @@ func main() {
 		viper.Set("HealthEndpoint", *flagHealthEndpoint)
 	}
 
+	// Configure logrus to output to stdout instead of stderr
+	log.SetOutput(os.Stdout)
+
 	// Report our status
 	log.Infof("%s %s", programName, programVersion)
 	log.Info("Run with --help parameter for commandline options")

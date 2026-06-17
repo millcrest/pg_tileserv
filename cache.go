@@ -154,8 +154,13 @@ func (c *TileCache) InvalidateBBox(ctx context.Context, xmin, ymin, xmax, ymax f
 	}
 
 	if addrCount > limit {
-		return 0, fmt.Errorf("bbox spans %d tile addresses (limit %d); reduce zoom range or bbox area",
-			addrCount, limit)
+		log.WithFields(log.Fields{
+			"addrCount": addrCount,
+			"limit":     limit,
+			"layerID":   layerID,
+			"srid":      srid,
+		}).Warn("bbox invalidation exceeds configured tile-address limit; invalidating full layer cache")
+		return c.scanAndUnlink(ctx, tilePrefixPattern(layerID, iHash), nil)
 	}
 
 	targets := make(map[[3]int]struct{}, addrCount)
